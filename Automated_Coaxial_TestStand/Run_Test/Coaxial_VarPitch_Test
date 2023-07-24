@@ -1,0 +1,543 @@
+import time
+import sys
+import os
+from ADS1256_definitions import *
+from ADS1256_PiGPIO import ADS1256
+import pandas as pd
+import threading
+import pigpio
+import numpy as np
+import RPi.GPIO as GPIO
+from math import sqrt
+
+import paho.mqtt.client as mqtt
+import MQTT_RunTest_Definitions_Coaxial_VarPitch as mqtt_com
+
+import Uncertainty_and_Plotting as up
+
+path_Calib = r'/home/ubuntu/src/Co_Axial_Stand/Calibration'
+path_Data = r'/home/ubuntu/src/Co_Axial_Stand/experiment/csv'
+
+#########
+# dynamixel initialization
+#########
+import os
+os.system ("sudo pigpiod") #Launching GPIO library
+if os.name == 'nt':
+    import msvcrt
+    def getch():
+        return msvcrt.getch().decode()
+else:
+    import sys, tty, termios
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    def getch():
+        try:
+            tty.setraw(sys.stdin.fileno())
+            ch = sys.stdin.read(1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        return ch
+
+from dynamixel_sdk import * # Uses Dynamixel SDK library
+
+MY_DXL = 'X_SERIES'
+
+# Control table address
+ADDR_TORQUE_ENABLE          = 64
+ADDR_GOAL_POSITION          = 116
+ADDR_GOAL_VELOCITY          = 104
+ADDR_PRESENT_POSITION       = 132
+DXL_MINIMUM_POSITION_VALUE  = 0         # Refer to the Minimum Position Limit of product eManual
+DXL_MAXIMUM_POSITION_VALUE  = 4095      # Refer to the Maximum Position Limit of product eManual
+BAUDRATE                    = 57600
+
+# DYNAMIXEL Protocol Version (1.0 / 2.0)
+# https://emanual.robotis.com/docs/en/dxl/protocol2/
+PROTOCOL_VERSION            = 2.0
+
+# Factory default ID of all DYNAMIXEL is 1
+DXL_ID                      = 1
+
+# Use the actual port assigned to the U2D2.
+# ex) Windows: "COM*", Linux: "/dev/ttyUSB*", Mac: "/dev/tty.usbserial-*"
+DEVICENAME                  = '/dev/ttyUSB0'
+
+TORQUE_ENABLE               = 1     # Value for enabling the torque
+TORQUE_DISABLE              = 0     # Value for disabling the torque
+DXL_MOVING_STATUS_THRESHOLD = 10    # Dynamixel moving status threshold
+
+index = 0
+dxl_goal_position = 0         # Goal position
+# Initialize PortHandler instance
+# Set the port path
+# Get methods and members of PortHandlerLinux or PortHandlerWindows
+portHandler = PortHandler(DEVICENAME)
+
+# Initialize PacketHandler instance
+# Set the protocol version
+# Get methods and members of Protocol1PacketHandler or Protocol2PacketHandler
+packetHandler = PacketHandler(PROTOCOL_VERSION)
+
+# Open port
+if portHandler.openPort():
+    print("Succeeded to open the port")
+else:
+    print("Failed to open the port")
+    print("Press any key to terminate...")
+    getch()
+    quit()
+
+# Set port baudrate
+if portHandler.setBaudRate(BAUDRATE):
+    print("Succeeded to change the baudrate")
+else:
+    print("Failed to change the baudrate")
+    print("Press any key to terminate...")
+    getch()
+    quit()
+
+# Set operating mode to extended position control mode
+dxl_comm_result, dxl_error = packetHandler.write1ByteTxRx(portHandler, DXL_ID, 11, 4)
+if dxl_comm_result != COMM_SUCCESS:
+    print("%s" % packetHandler.getTxRxResult(dxl_comm_result))
+elif dxl_error != 0:
+    print("%s" % packetHandler.getRxPacketError(dxl_error))
+else:
+    print("Operating mode changed to extended position control mode.")
+
+# Enable Dynamixel Torque
+dxl_comm_result, dxl_error = packetHandler.write1ByteTxRx(portHandler, DXL_ID, ADDR_TORQUE_ENABLE, TORQUE_ENABLE)
+if dxl_comm_result != COMM_SUCCESS:
+    print("%s" % packetHandler.getTxRxResult(dxl_comm_result))
+elif dxl_error != 0:
+    print("%s" % packetHandler.getRxPacketError(dxl_error))
+else:
+    print("Dynamixel has been successfully connected")
+
+def dynamixel_readPosition():
+   # Read present position
+   if (MY_DXL == 'XL320'): # XL320 uses 2 byte Position Data, Check the size of data in your DYNAMIXEL's control table
+      dxl_present_position, dxl_comm_result, dxl_error = packetHandler.read2ByteTxRx(portHandler, DXL_ID, ADDR_PRESENT_POSITION)
+   else:
+      dxl_present_position, dxl_comm_result, dxl_error = packetHandler.read4ByteTxRx(portHandler, DXL_ID, ADDR_PRESENT_POSITION)
+      if dxl_present_position > 0x7fffffff:
+         dxl_present_position = dxl_present_position - 4294967294
+   if dxl_comm_result != COMM_SUCCESS:
+      print("%s" % packetHandler.getTxRxResult(dxl_comm_result))
+   elif dxl_error != 0:
+      print("%s" % packetHandler.getRxPacketError(dxl_error))
+
+   print(f'Present position: {dxl_present_position}')
+
+   return dxl_present_position
+
+def dynamixel_writeGoalPosition(goal_position):
+   dxl_goal_position = goal_position
+   # Write goal position
+   if (MY_DXL == 'XL320'): # XL320 uses 2 byte Position Data, Check the size of data in your DYNAMIXEL's control table
+      dxl_comm_result, dxl_error = packetHandler.write2ByteTxRx(portHandler, DXL_ID, ADDR_GOAL_POSITION, dxl_goal_position)
+   else:
+      dxl_comm_result, dxl_error = packetHandler.write4ByteTxRx(portHandler, DXL_ID, ADDR_GOAL_POSITION, dxl_goal_position)
+   if dxl_comm_result != COMM_SUCCESS:
+      print("%s" % packetHandler.getTxRxResult(dxl_comm_result))
+   elif dxl_error != 0:
+      print("%s" % packetHandler.getRxPacketError(dxl_error))
+
+def dynamixel_writeGoalPosition_hold(goal_position):
+   dxl_goal_position = goal_position
+   # Write goal position
+   if (MY_DXL == 'XL320'): # XL320 uses 2 byte Position Data, Check the size of data in your DYNAMIXEL's control table
+      dxl_comm_result, dxl_error = packetHandler.write2ByteTxRx(portHandler, DXL_ID, ADDR_GOAL_POSITION, dxl_goal_position)
+   else:
+      dxl_comm_result, dxl_error = packetHandler.write4ByteTxRx(portHandler, DXL_ID, ADDR_GOAL_POSITION, dxl_goal_position)
+   if dxl_comm_result != COMM_SUCCESS:
+      print("%s" % packetHandler.getTxRxResult(dxl_comm_result))
+   elif dxl_error != 0:
+      print("%s" % packetHandler.getRxPacketError(dxl_error))
+   while 1:
+      # Read present position
+      if (MY_DXL == 'XL320'): # XL320 uses 2 byte Position Data, Check the size of data in your DYNAMIXEL's control table
+         dxl_present_position, dxl_comm_result, dxl_error = packetHandler.read2ByteTxRx(portHandler, DXL_ID, ADDR_PRESENT_POSITION)
+      else:
+         dxl_present_position, dxl_comm_result, dxl_error = packetHandler.read4ByteTxRx(portHandler, DXL_ID, ADDR_PRESENT_POSITION)
+         if dxl_present_position > 0x7fffffff:
+               dxl_present_position = dxl_present_position - 4294967294
+
+      if dxl_comm_result != COMM_SUCCESS:
+         print("%s" % packetHandler.getTxRxResult(dxl_comm_result))
+      elif dxl_error != 0:
+         print("%s" % packetHandler.getRxPacketError(dxl_error))
+
+      print("[ID:%03d] GoalPos:%03d  PresPos:%03d" % (DXL_ID, dxl_goal_position, dxl_present_position))
+
+      if not abs(dxl_goal_position - dxl_present_position) > DXL_MOVING_STATUS_THRESHOLD:
+            break
+
+def dynamixel_clearMultiTurnInfo():
+   # Clear Multi-Turn Information
+   dxl_comm_result, dxl_error = packetHandler.clearMultiTurn(portHandler, DXL_ID)
+   if dxl_comm_result != COMM_SUCCESS:
+      print("%s" % packetHandler.getTxRxResult(dxl_comm_result))
+   elif dxl_error != 0:
+      print("%s" % packetHandler.getRxPacketError(dxl_error))
+
+
+
+def dynamixel_DisableTorque():
+   xl_comm_result, dxl_error = packetHandler.write1ByteTxRx(portHandler, DXL_ID, ADDR_TORQUE_ENABLE, TORQUE_DISABLE)
+   if dxl_comm_result != COMM_SUCCESS:
+      print("%s" % packetHandler.getTxRxResult(dxl_comm_result))
+   elif dxl_error != 0:
+      print("%s" % packetHandler.getRxPacketError(dxl_error))   
+
+def dynamixel_End():
+   portHandler.closePort()
+
+def convert_Dist_to_Turns(dist, zero_pos):
+    turns = np.zeros_like(dist, dtype = int)
+    for i in range(len(dist)):
+        turns[i] = dist[i]*4095 + zero_pos
+    return turns
+
+
+def convert_Turns_to_Dist(turns, dynamixel_zero_turns):
+   # dist = np.zeros_like(turns, dtype = int)
+    zero_dist = 265 # mm
+   #  for i in range(len(turns)):
+   #      dist[i] = (turns[i]-dynamixel_zero_turns)/4095 + zero_dist
+    return (turns-dynamixel_zero_turns)/4095 + zero_dist
+
+# %% Set up MQTT Communications
+
+client = mqtt_com.setup_test_client()
+
+
+msg_flag_DC_Front_position = 0
+DC_Front_position = 0 
+
+msg_flag_DC_Front_zero = 0
+DC_Front_Zero_State = 0
+
+msg_flag_DC_Back_position = 0
+DC_Back_position = 0 
+
+msg_flag_DC_Back_zero = 0
+DC_Back_Zero_State = 0
+
+msg_flag_Dynamixel_zero = 0
+Dynamixel_have_been_zerod = 0
+
+
+pitch_calibration_fits = pd.read_csv(path_Calib + f'/Pitch_Calibration_F.csv')
+pitch_calibration_fits = pitch_calibration_fits.to_numpy()
+pitch_calibration_fits = pitch_calibration_fits[1,:].astype(np.float64)
+Front_pitch_fit_a = pitch_calibration_fits[1]
+Front_pitch_fit_b = pitch_calibration_fits[2]
+Front_pitch_fit_c = pitch_calibration_fits[3]
+
+pitch_calibration_fits = pd.read_csv(path_Calib + f'/Pitch_Calibration_B.csv')
+pitch_calibration_fits = pitch_calibration_fits.to_numpy()
+pitch_calibration_fits = pitch_calibration_fits[1,:].astype(np.float64)
+Back_pitch_fit_a = pitch_calibration_fits[1]
+Back_pitch_fit_b = pitch_calibration_fits[2]
+Back_pitch_fit_c = pitch_calibration_fits[3]
+
+def Front_Pitch_to_DCPosition(y, a, b, c):
+    return (-b + sqrt(b**2 - (4*a*(c-y))))/(2*a)
+
+def Back_Pitch_to_DCPosition(y, a, b, c):
+    return (-b - sqrt(b**2 - (4*a*(c-y))))/(2*a)
+
+
+def Set_DC_Front_Zero():
+
+    try:    
+        # publishing setpoint as string
+            msg = str("")
+            pubMsg = client.publish(
+                topic='rpi/FrontSetDCZero',
+                payload=msg.encode('utf-8'),
+                qos=0,
+            )
+            pubMsg.wait_for_publish()
+            print(pubMsg.is_published())
+    except Exception as e:
+        print(e)
+
+def Set_DC_Back_Zero():
+
+    try:    
+        # publishing setpoint as string
+            msg = str("")
+            pubMsg = client.publish(
+                topic='rpi/BackSetDCZero',
+                payload=msg.encode('utf-8'),
+                qos=0,
+            )
+            pubMsg.wait_for_publish()
+            print(pubMsg.is_published())
+    except Exception as e:
+        print(e)
+
+def Set_DC_Front_Setpoint(setpoint):
+    try:
+        # publishing setpoint as string
+        msg = str(setpoint)
+        pubMsg = client.publish(
+            topic='rpi/FrontPitchSetpoint',
+            payload=msg.encode('utf-8'),
+            qos=0,
+        )
+        pubMsg.wait_for_publish()
+        print(pubMsg.is_published())
+    except Exception as e:
+        print(e)
+
+def Set_DC_Back_Setpoint(setpoint):
+    try:
+        # publishing setpoint as string
+        msg = str(setpoint)
+        pubMsg = client.publish(
+            topic='rpi/BackPitchSetpoint',
+            payload=msg.encode('utf-8'),
+            qos=0,
+        )
+        pubMsg.wait_for_publish()
+        print(pubMsg.is_published())
+    except Exception as e:
+        print(e)
+
+
+def Reset_Dynamixel_Zero():
+    try:
+         # publishing setpoint as string
+         msg = str(' ')
+         pubMsg = client.publish(
+            topic='rpi/ResetDynamixelZero',
+            payload=msg.encode('utf-8'),
+            qos=0,
+         )
+         pubMsg.wait_for_publish()
+         print(pubMsg.is_published())
+    except Exception as e:
+         print(e)
+
+def Set_Dynamixel_Zero_Flag():
+    try:
+         # publishing setpoint as string
+         msg = str(' ')
+         pubMsg = client.publish(
+            topic='rpi/SetDynamixelZero',
+            payload=msg.encode('utf-8'),
+            qos=0,
+         )
+         pubMsg.wait_for_publish()
+         print(pubMsg.is_published())
+    except Exception as e:
+         print(e)    
+
+
+def on_message(client, userdata, msg):
+    # print(msg.topic + '' + str(msg.payload))
+
+
+    if msg.topic == "DC_Front_Position":
+        message = str(msg.payload.decode("utf-8"))
+
+        global DC_Front_position
+        DC_Front_position = float(message)
+
+        global msg_flag_DC_Front_position
+        msg_flag_DC_Front_position = 1  
+        
+    if msg.topic == "DC_Front_Zero":
+        message = str(msg.payload.decode("utf-8"))
+
+        global DC_Front_Zero_State
+        DC_Front_Zero_State = float(message)
+
+        global msg_flag_DC_Front_zero
+        msg_flag_DC_Front_zero = 1
+
+    if msg.topic == "DC_Back_Position":
+        message = str(msg.payload.decode("utf-8"))
+
+        global DC_Back_position
+        DC_Back_position = float(message)
+        print("here")
+
+        global msg_flag_DC_Back_position
+        msg_flag_DC_Back_position = 1  
+        
+    if msg.topic == "DC_Back_Zero":
+        message = str(msg.payload.decode("utf-8"))
+
+        global DC_Back_Zero_State
+        DC_Back_Zero_State = float(message)
+
+        global msg_flag_DC_Back_zero
+        msg_flag_DC_Back_zero = 1  
+
+    if msg.topic == "Zero_Switch":
+        message = str(msg.payload.decode("utf-8"))
+
+        global Dynamixel_have_been_zerod
+        Dynamixel_have_been_zerod = float(message)
+
+        global msg_flag_Dynamixel_zero
+        msg_flag_Dynamixel_zero= 1  
+
+
+client.on_message = on_message 
+
+
+
+
+while True: 
+    print("vp front, vp back, dynamixel, or break")
+    inp = input()
+
+
+    if inp == "vp front":
+        while True:
+
+            
+
+            setpoints = np.arange(0, -5000-500, -500)
+
+            if DC_Front_Zero_State == 0:
+                Set_DC_Front_Zero()
+
+                time.sleep(5)
+
+                for i in range(len(setpoints)):
+                    if DC_Front_Zero_State == 1:
+                        msg_flag_DC_Front_position = 0
+                        break
+
+                    Set_DC_Front_Setpoint(setpoints[i])
+
+                    while msg_flag_DC_Front_position == 0:
+                        print('waiting for inputs', end = '\r')
+                        
+                    print("\n")    
+                    time.sleep(2)
+                    msg_flag_DC_Front_position = 0
+
+                    
+            
+                print("DC Motor Zero'd")
+
+            print("Enter in a pitch value or break: ")
+            inp = input()
+            if inp == "break":
+                break
+            else: 
+                pitch = float(inp)
+                position = Front_Pitch_to_DCPosition(pitch, Front_pitch_fit_a, Front_pitch_fit_b, Front_pitch_fit_c)
+                print(position)
+                print(msg_flag_DC_Front_position)
+                inp = input()
+                Set_DC_Front_Setpoint(position)
+                
+                while msg_flag_DC_Front_position == 0:
+                    print('waiting for pitch adjustment', end='\r')
+                msg_flag_DC_Front_position = 0
+
+    if inp == "vp back":
+        while True:
+
+            
+
+            setpoints = np.arange(0, -5000-500, -500)
+
+            if DC_Back_Zero_State == 0:
+                Set_DC_Back_Zero()
+
+                time.sleep(5)
+
+                for i in range(len(setpoints)):
+                    if DC_Back_Zero_State == 1:
+                        msg_flag_DC_Back_position = 0
+                        break
+
+                    Set_DC_Back_Setpoint(setpoints[i])
+
+                    while msg_flag_DC_Back_position == 0:
+                        print('waiting for inputs', end = '\r')
+                        
+                    print("\n")    
+                    time.sleep(2)
+                    msg_flag_DC_Back_position = 0
+
+                    
+            
+                print("DC Motor Zero'd")
+
+            print("Enter in a pitch value or break: ")
+            inp = input()
+            if inp == "break":
+                break
+            else: 
+                pitch = float(inp)
+                position = Back_Pitch_to_DCPosition(pitch, Back_pitch_fit_a, Back_pitch_fit_b, Back_pitch_fit_c)
+                print(position)
+                print(msg_flag_DC_Back_position)
+                inp = input()
+                Set_DC_Back_Setpoint(position)
+                
+                while msg_flag_DC_Back_position == 0:
+                    print('waiting for pitch adjustment', end='\r')
+                msg_flag_DC_Back_position = 0
+
+    elif inp == "dynamixel":
+        Reset_Dynamixel_Zero()
+        Set_Dynamixel_Zero_Flag()
+        
+        print('Zeroing dynamixel')
+        
+        time.sleep(5)
+
+        pos = dynamixel_readPosition()
+
+        time.sleep(3)
+
+        while True:
+            
+            if Dynamixel_have_been_zerod == 1:
+                dxl_present_position = dynamixel_readPosition()
+                dynamixel_writeGoalPosition(dxl_present_position)
+                time.sleep(0.3)
+                dynamixel_clearMultiTurnInfo()
+                dxl_present_position = dynamixel_readPosition()
+                dynamixel_writeGoalPosition(dxl_present_position)
+                dxl_zero_position = dxl_goal_position
+                break
+            else:
+                pos -= 4095
+                dynamixel_writeGoalPosition(pos)
+                time.sleep(3)
+        
+        while True:
+
+            print("Enter Coaxial spaing (mm) starting from 0 or break: ")
+            inp = input()
+
+            if inp == "break":
+                # dynamixel_writeGoalPosition(dxl_zero_position)
+                Reset_Dynamixel_Zero()
+                break
+            else:
+
+                inp = float(inp)
+                Dynamixel_setpoints = np.array([inp])
+                Dynamixel_setpoints = convert_Dist_to_Turns(Dynamixel_setpoints, dxl_zero_position)
+
+
+            dynamixel_writeGoalPosition_hold(Dynamixel_setpoints[0])
+
+    elif inp == "break":
+        break
+
+
